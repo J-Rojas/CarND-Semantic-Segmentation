@@ -113,16 +113,7 @@ def layers(vgg_layer3_out, vgg_layer4_out, vgg_layer7_out, num_classes):
                                     #activation=activation,
                                     name='upscale_1')
         #upscale_1 = tf.Print(upscale_1, ("upscale_1 shape ", tf.shape_n([upscale_1])[0][1:4]))
-        #print("upscale_1 ", tf.shape_n([upscale_1])[0])
-        #print("vgg_layer4_out  ", tf.shape_n([vgg_layer4_out])[0])
-
         #upscale_1 = tf.Print(upscale_1, ("vgg_layer4_out shape ", tf.shape_n([vgg_layer4_out])[0][1:4]))
-
-        #reshape_1 = tf.reshape(upscale_1, tf.shape_n([fc_layer_2])[0], name='reshape_1')
-        #reshape_1 = tf.Print(reshape_1, ("reshape_1 shape ", tf.shape_n([reshape_1])[0][1:4]))
-
-        # slice the upscale_1 to match the fc_layer_2
-        # slice_upscale_1 = tf.slice(upscale_1, [0, 1, 1, 0], tf.shape_n([fc_layer_2])[0], name='slice_upscale_1')
 
         # skip connection with pooled layer 4
         skip_1 = tf.add(upscale_1, fc_layer_2, name='skip_1')
