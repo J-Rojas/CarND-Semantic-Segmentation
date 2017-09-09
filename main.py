@@ -3,9 +3,11 @@ import tensorflow as tf
 import helper
 import warnings
 import typing
+import sys
 from distutils.version import LooseVersion
 import project_tests as tests
 
+FREEZE_VGG = False
 
 # Check TensorFlow Version
 assert LooseVersion(tf.__version__) >= LooseVersion('1.0'), 'Please use TensorFlow version 1.0 or newer.  You are using {}'.format(tf.__version__)
@@ -22,6 +24,17 @@ def print_variables(sess, variables_names):
     for k, v in zip(variables_names, values):
         print ("Variable: ", k)
         print ("Shape: ", v.shape)
+
+def trainable_variables():
+    trainable_variables = []
+    if FREEZE_VGG:
+        # get trainable variables from 'fcn' scope
+        trainable_variables = tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES, scope='fcn')
+
+    if len(trainable_variables) == 0:
+        trainable_variables = tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES)
+
+    return trainable_variables
 
 def load_vgg(sess, vgg_path):
     """
@@ -40,8 +53,6 @@ def load_vgg(sess, vgg_path):
     vgg_layer7_out_tensor_name = 'layer7_out:0'
 
     tf.saved_model.loader.load(sess, [vgg_tag], vgg_path)
-
-
     vgg_input = tf.get_default_graph().get_tensor_by_name(vgg_input_tensor_name)
     vgg_keep_prob = tf.get_default_graph().get_tensor_by_name(vgg_keep_prob_tensor_name)
     vgg_layer3 = tf.get_default_graph().get_tensor_by_name(vgg_layer3_out_tensor_name)
@@ -74,14 +85,13 @@ def layers(vgg_layer3_out, vgg_layer4_out, vgg_layer7_out, num_classes):
     #vgg_layer7_out = tf.Print(vgg_layer7_out, ("vgg_layer7_out shape ", tf.shape_n([vgg_layer7_out])[0][1:4]))
 
     regularizer = tf.contrib.layers.l2_regularizer(1e-3)
-    #activation = None #tf.nn.relu
-    #initializer = tf.random_normal_initializer
-
+    activation = tf.nn.relu
+    initializer = tf.contrib.layers.xavier_initializer()
 
     with tf.variable_scope("fcn"):
         fc_layer_1 = tf.layers.conv2d(vgg_layer7_out, num_classes, 1, strides=(1,1),
                                       padding='same',
-                                      #kernel_initializer=initializer,
+                                      kernel_initializer=initializer,
                                       kernel_regularizer=regularizer,
                                       #activation=activation,
                                       name='fc_layer_1')
@@ -89,7 +99,7 @@ def layers(vgg_layer3_out, vgg_layer4_out, vgg_layer7_out, num_classes):
 
         fc_layer_2 = tf.layers.conv2d(vgg_layer4_out, num_classes, 1, strides=(1,1),
                                     padding='same',
-                                    #kernel_initializer=initializer,
+                                    kernel_initializer=initializer,
                                     kernel_regularizer=regularizer,
                                     #activation=activation,
                                     name='fc_layer_2')
@@ -97,7 +107,7 @@ def layers(vgg_layer3_out, vgg_layer4_out, vgg_layer7_out, num_classes):
 
         fc_layer_3 = tf.layers.conv2d(vgg_layer3_out, num_classes, 1, strides=(1,1),
                                     padding='same',
-                                    #kernel_initializer=initializer,
+                                    kernel_initializer=initializer,
                                     kernel_regularizer=regularizer,
                                     #activation=activation,
                                     name='fc_layer_3')
@@ -107,7 +117,7 @@ def layers(vgg_layer3_out, vgg_layer4_out, vgg_layer7_out, num_classes):
 
         # 2x upscale
         upscale_1 = tf.layers.conv2d_transpose(fc_layer_1, num_classes, 4, strides=(2, 2),
-                                    #kernel_initializer=initializer,
+                                    kernel_initializer=initializer,
                                     kernel_regularizer=regularizer,
                                     padding='same',
                                     #activation=activation,
@@ -122,7 +132,7 @@ def layers(vgg_layer3_out, vgg_layer4_out, vgg_layer7_out, num_classes):
 
         # 2x upscale
         upscale_2 = tf.layers.conv2d_transpose(skip_1, num_classes, 4, strides=(2, 2),
-                                    #kernel_initializer=initializer,
+                                    kernel_initializer=initializer,
                                     kernel_regularizer=regularizer,
                                     padding='same',
                                     #activation=activation,
@@ -131,18 +141,74 @@ def layers(vgg_layer3_out, vgg_layer4_out, vgg_layer7_out, num_classes):
         # skip connection with pooled layer 3
         skip_2 = tf.add(upscale_2, fc_layer_3, name='skip_2')
 
-        # 8x upscale to match original image dimensions
-        upscale_3 = tf.layers.conv2d_transpose(skip_2, num_classes, 16, strides=(8, 8),
-                                    #kernel_initializer=initializer,
+        # 4x upscale
+        upscale_3 = tf.layers.conv2d_transpose(skip_2, num_classes, 8, strides=(4, 4),
+                                    kernel_initializer=initializer,
                                     kernel_regularizer=regularizer,
                                     #activation=activation,
                                     padding='same',
                                     name='upscale_3')
+
+        # convolution to correlate neighboring pixel losses with each other... better precision/less noise since neighboring pixels should be related
+        conv_3_1 = tf.layers.conv2d(upscale_3, num_classes, 3, strides=(1, 1),
+                                    kernel_initializer=initializer,
+                                    kernel_regularizer=regularizer,
+                                    activation=activation,
+                                    padding='same',
+                                    name='conv_3_1')
+
+        # avg pool 2x downscale - similar reasoning as above
+        downscale_3_2 = tf.layers.average_pooling2d(conv_3_1, pool_size=(3, 3), strides=(2, 2),
+                                    padding='same',
+                                    name='downscale_3_2')
+
+        # 4x upsample to match original image
+        upscale_4 = tf.layers.conv2d_transpose(downscale_3_2, num_classes, 8, strides=(4, 4),
+                                    kernel_initializer=initializer,
+                                    kernel_regularizer=regularizer,
+                                    #activation=activation,
+                                    padding='same',
+                                    name='upscale_4')
+
+        # convolution to correlate neighboring pixel losses with each other... better precision/less noise since neighboring pixels should be related
+        conv_4_1 = tf.layers.conv2d(upscale_4, num_classes, 3, strides=(1, 1),
+                                    kernel_initializer=initializer,
+                                    kernel_regularizer=regularizer,
+                                    activation=activation,
+                                    padding='same',
+                                    name='conv_4_1')
+
+        # avg pool 2x downscale - similar reasoning as above
+        downscale_4_2 = tf.layers.average_pooling2d(conv_4_1, pool_size=(3, 3), strides=(2, 2),
+                                    padding='same',
+                                    name='downscale_4_2')
+
+        # 4x upsample to match original image
+        upscale_5 = tf.layers.conv2d_transpose(downscale_4_2, num_classes, 8, strides=(4, 4),
+                                    kernel_initializer=initializer,
+                                    kernel_regularizer=regularizer,
+                                    #activation=activation,
+                                    padding='same',
+                                    name='upscale_5')
+
+        # convolution to correlate neighboring pixel losses with each other... better precision/less noise since neighboring pixels should be related
+        conv_5_1 = tf.layers.conv2d(upscale_5, num_classes, 3, strides=(1, 1),
+                                    kernel_initializer=initializer,
+                                    kernel_regularizer=regularizer,
+                                    activation=activation,
+                                    padding='same',
+                                    name='conv_5_1')
+
+        # avg pool 2x downscale - similar reasoning as above
+        downscale_5_2 = tf.layers.average_pooling2d(conv_5_1, pool_size=(3, 3), strides=(2, 2),
+                                    padding='same',
+                                    name='downscale_5_2')
+
         #upscale_3 = tf.Print(upscale_3, ("upscale_3 shape ", tf.shape_n([upscale_3])[0][1:4]))
 
-    print(upscale_3.name)
+    print(downscale_5_2.name)
 
-    return upscale_3
+    return downscale_5_2
 tests.test_layers(layers)
 
 
@@ -156,24 +222,19 @@ def optimize(nn_last_layer, correct_label, learning_rate, num_classes):
     :return: Tuple of (logits, train_op, cross_entropy_loss)
     """
 
-    # get trainable variables from 'fcn' scope
-    trainable_variables = tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES, scope='fcn')
-    if len(trainable_variables) == 0:
-        trainable_variables = tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES)
+    #print(trainable_variables)
 
-    print(trainable_variables)
-
-    logits = tf.reshape(nn_last_layer, (-1, num_classes))
-    cross_entropy_loss = tf.reduce_mean(tf.nn.softmax_cross_entropy_with_logits(logits=logits, labels=correct_label))
+    logits = tf.reshape(nn_last_layer, (-1, num_classes), name="logits")
+    cross_entropy_loss = tf.reduce_mean(tf.nn.softmax_cross_entropy_with_logits(logits=logits, labels=correct_label), name="cross_entropy_loss")
     trainer = tf.train.AdamOptimizer(learning_rate=learning_rate)
-    train_op = trainer.minimize(cross_entropy_loss, var_list=trainable_variables)
+    train_op = trainer.minimize(cross_entropy_loss, var_list=trainable_variables(), name="train_op")
 
     return logits, train_op, cross_entropy_loss
 tests.test_optimize(optimize)
 
 
 def train_nn(sess, epochs, batch_size, get_batches_fn, train_op, cross_entropy_loss, input_image,
-             correct_label, keep_prob, learning_rate):
+             correct_label, keep_prob, learning_rate, saver=None):
     """
     Train neural network and print out the loss during training.
     :param sess: TF Session
@@ -188,27 +249,33 @@ def train_nn(sess, epochs, batch_size, get_batches_fn, train_op, cross_entropy_l
     :param learning_rate: TF Placeholder for learning rate
     """
 
-    sess.run(tf.global_variables_initializer())
-
     variables_names = [v.name for v in tf.trainable_variables()]
     print_variables(sess, variables_names)
 
     for epoch in range(epochs):
+        total_loss = 0
         print('Epoch ', epoch)
         #retrieve training data
         batch = 1
         for train_data, label_data in get_batches_fn(batch_size):
-            feed_dict={input_image: train_data, correct_label: label_data, learning_rate: 0.001, keep_prob: 0.5}
+            feed_dict={input_image: train_data, correct_label: label_data, learning_rate: 0.001, keep_prob: 0.9}
             _, loss = sess.run([train_op, cross_entropy_loss], feed_dict)
-            print('    batch ', batch, ' loss = ', loss)
+            #print('    batch ', batch, ' loss = ', loss)
             batch += 1
+            total_loss += loss
+
+        print('    avg loss = ', total_loss / (batch - 1))
+
+        if saver:
+            saver.save(sess, './runs/savedModel', global_step=epoch+1)
+            print('    saving to ./runs/savedModel-{}'.format(epoch+1))
 
 tests.test_train_nn(train_nn)
 
-def run():
+def run(modelFile):
     num_classes = 2
     epochs = 30
-    batch_size = 8
+    batch_size = 2
     image_shape = (160, 576)
     data_dir = './data'
     runs_dir = './runs'
@@ -221,7 +288,12 @@ def run():
     # You'll need a GPU with at least 10 teraFLOPS to train on.
     #  https://www.cityscapes-dataset.com/
 
+    save_file = None
+    if modelFile:
+        save_file = './' + modelFile # String addition used for emphasis
+
     with tf.Session() as sess:
+
         # Path to vgg model
         vgg_path = os.path.join(data_dir, 'vgg')
         # Create function to get batches
@@ -231,25 +303,56 @@ def run():
         #  https://datascience.stackexchange.com/questions/5224/how-to-prepare-augment-images-for-neural-network
 
         # Build NN using load_vgg, layers, and optimize function
-        input_image, keep_prob_layer, vgg_layer_3, vgg_layer_4, vgg_layer_7 = load_vgg(sess, vgg_path)
-        nn_last_layer = layers(vgg_layer_3, vgg_layer_4, vgg_layer_7, num_classes)
 
-        correct_label = tf.placeholder(tf.float32, [None, image_shape[0], image_shape[1], num_classes])
-        learning_rate = tf.placeholder(tf.float32, name='learning_rate')
+        # Load model
+        if save_file:
+            saver = tf.train.import_meta_graph(save_file + '.meta')
+            saver.restore(sess, save_file)
+            input_image, keep_prob_layer, vgg_layer_3, vgg_layer_4, vgg_layer_7 = \
+                tf.get_default_graph().get_tensor_by_name("image_input:0"), \
+                tf.get_default_graph().get_tensor_by_name("keep_prob:0"), \
+                tf.get_default_graph().get_tensor_by_name("layer3_out:0"), \
+                tf.get_default_graph().get_tensor_by_name("layer4_out:0"), \
+                tf.get_default_graph().get_tensor_by_name("layer7_out:0")
+            nn_last_layer = tf.get_default_graph().get_tensor_by_name("fcn/upscale_3/bias:0")
+            logits = tf.get_default_graph().get_tensor_by_name("logits:0")
+            cross_entropy_loss = tf.get_default_graph().get_tensor_by_name("cross_entropy_loss:0")
+            correct_label = tf.get_default_graph().get_tensor_by_name("correct_label:0")
+            learning_rate = tf.get_default_graph().get_tensor_by_name("learning_rate:0")
+            train_op = tf.get_default_graph().get_operation_by_name("train_op")
+            print('    loading layers from {}'.format(save_file))
+        else:
+            correct_label = tf.placeholder(tf.float32, [None, image_shape[0], image_shape[1], num_classes], name='correct_label')
+            learning_rate = tf.placeholder(tf.float32, name='learning_rate')
+            input_image, keep_prob_layer, vgg_layer_3, vgg_layer_4, vgg_layer_7 = load_vgg(sess, vgg_path)
+            nn_last_layer = layers(vgg_layer_3, vgg_layer_4, vgg_layer_7, num_classes)
+            logits, train_op, cross_entropy_loss = optimize(nn_last_layer, correct_label, learning_rate, num_classes)
+            sess.run(tf.global_variables_initializer())
+            saver = tf.train.Saver(max_to_keep=1)
 
-        logits, train_op, cross_entropy_loss = optimize(nn_last_layer, correct_label, learning_rate, num_classes)
+        #tf.contrib.layers.summarize_collection(tf.GraphKeys.TRAINABLE_VARIABLES)
+        #tf.summary.merge_all()
+        #train_writer = tf.summary.FileWriter('./summary/train',
+        #                              sess.graph)
+
+        if save_file is None:
+            saver.save(sess, './runs/savedModel', global_step=0)
+            print('    saving to ./runs/savedModel-{}'.format(0))
+
+        #sess.run(tf.variables_initializer())
 
         # Train NN using the train_nn function
-        train_nn(sess, epochs, batch_size, get_batches_fn, train_op, cross_entropy_loss, input_image, correct_label, keep_prob_layer, learning_rate)
+        train_nn(sess, epochs, batch_size, get_batches_fn, train_op, cross_entropy_loss, input_image, correct_label, keep_prob_layer, learning_rate,
+                 saver=saver)
 
         # Save inference data using helper.save_inference_samples
         helper.save_inference_samples(runs_dir, data_dir, sess, image_shape, logits, keep_prob_layer, input_image)
-
-        saver = tf.train.Saver()
-        saver.save(sess, './runs/savedModel')
 
         # OPTIONAL: Apply the trained model to a video
 
 
 if __name__ == '__main__':
-    run()
+    model_file = sys.argv[1] if len(sys.argv) > 1 else None
+    if model_file:
+        print('Loading model file {}'.format(model_file))
+    run(model_file)
